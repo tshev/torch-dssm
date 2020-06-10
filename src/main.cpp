@@ -7,11 +7,8 @@ namespace sgl {
 namespace dssm {
 struct dssm_config {
     int64_t fanin;
-
     int64_t middle;
-
     int64_t fanout;
-
     float dropout;
 };
 
@@ -19,8 +16,21 @@ struct parser_config {
     std::string outer_separator = "\n";
     std::string inner_separator = "\t";
     std::string array_separator = "|";
-    size_t batch_size = 1024;
-    size_t minibatch_size = 5;
+    size_t mini_batch_size = 1024;
+    size_t query_group_size = 5;
+};
+
+struct training_config {
+    float learning_rate;
+    size_t epochs;
+};
+
+struct application_config {
+    sgl::dssm::dssm_config dssm_config;
+    sgl::dssm::parser_config parser_config;
+    sgl::dssm::training_config training_config;
+    std::string input_sample;
+    std::string output;
 };
 
 template<typename O, typename T>
@@ -31,12 +41,12 @@ O& operator<<(O& o, const std::vector<T>& value) {
     return o;
 }
 
-
 struct dssm : torch::nn::Module {
 public:
     struct mlp : torch::nn::Module  {
         dssm_config config_;
         torch::nn::Linear fc1{nullptr}, fc2{nullptr}, fc3{nullptr};
+        torch::nn::BatchNorm1d bn{nullptr};
 
     public:
         mlp() = default;
@@ -44,12 +54,13 @@ public:
             fc1 = register_module("fc1", torch::nn::Linear(config_.fanin, config_.middle));
             fc2 = register_module("fc2", torch::nn::Linear(config_.middle, config_.middle));
             fc3 = register_module("fc3", torch::nn::Linear(config_.middle, config_.fanout));
+            bn = register_module("bn", torch::nn::BatchNorm1d(config_.middle));
         }
         mlp(mlp&&) = default;
         mlp(const mlp&) = delete;
 
         torch::Tensor forward(const torch::Tensor& a) {
-            auto x = torch::selu(fc1->forward(a));
+            auto x = torch::selu(bn->forward(fc1->forward(a)));
             x = torch::dropout(x, config_.dropout, is_training());
             x = torch::selu(fc2->forward(x));
             return torch::selu(fc3->forward(x));
@@ -212,7 +223,7 @@ struct unicode_char_ngrams_view {
 };
 
 
-struct similarity_model_trainer {
+struct ranking {
     sgl::dssm::parser_config parser_config_;
     sgl::dssm::dssm dssm_;
     torch::optim::Adam optimizer_;
@@ -239,7 +250,7 @@ struct similarity_model_trainer {
 
 
         int64_t vector_size = trigrams_registry.max_index();
-        size_t n = parser_config_.minibatch_size * parser_config_.batch_size;
+        size_t n = parser_config_.query_group_size * parser_config_.mini_batch_size;
         if (queries.size() < n) {
             return false;
         }
@@ -250,8 +261,8 @@ struct similarity_model_trainer {
         sgl::v1::array<float> tensor_y(n * trigrams_registry.max_index());
         auto pos_y = tensor_y.begin();
 
-        for (size_t i = 0; i < n; i += parser_config_.minibatch_size) {
-            for (size_t j = 0; j < parser_config_.minibatch_size; ++j) {
+        for (size_t i = 0; i < n; i += parser_config_.query_group_size) {
+            for (size_t j = 0; j < parser_config_.query_group_size; ++j) {
                 pos_x = std::copy(queries[i].begin(), queries[i].end(), pos_x);
                 pos_y = std::copy(documents[i + j].begin(), documents[i + j].end(), pos_y);
             }
@@ -267,9 +278,9 @@ struct similarity_model_trainer {
         // std::cout << input_tensor_x << std::endl << input_tensor_y << std::endl;
         
         auto start = std::chrono::high_resolution_clock::now();
-        loss_ = sgl::dssm::fit(optimizer_, dssm_, input_tensor_x, input_tensor_y, parser_config_.minibatch_size).item<float>();
+        loss_ = sgl::dssm::fit(optimizer_, dssm_, input_tensor_x, input_tensor_y, parser_config_.query_group_size).item<float>();
         auto end = std::chrono::high_resolution_clock::now();
-        std::cout << "Toch took: " << std::chrono::duration<float>(end - start).count() << "; ";
+        std::cout << "Torch took: " << std::chrono::duration<float>(end - start).count() << " sec.; ";
         queries.pop_front();
         documents.pop_front();
         return true;
@@ -313,19 +324,6 @@ void test() {
     torch::from_blob(std::vector<int>{1, 2, 3}.data(), 3);
 }
 
-struct training_config {
-    float learning_rate;
-    size_t epochs;
-};
-
-struct application_config {
-    sgl::dssm::dssm_config dssm_config;
-    sgl::dssm::parser_config parser_config;
-    sgl::dssm::training_config training_config;
-    std::string input_sample;
-    std::string output;
-};
-
 void train(sgl::dssm::application_config application_config) {
     sgl::v1::stopwatch_nanoseconds sw;
     auto data = sgl::v1::fmmap<char>(application_config.input_sample.data());
@@ -357,7 +355,7 @@ void train(sgl::dssm::application_config application_config) {
 
     sgl::dssm::dssm dssm(application_config.dssm_config);
     torch::optim::Adam optimizer(dssm.parameters(), application_config.training_config.learning_rate);
-    sgl::dssm::similarity_model_trainer similarity_model_trainer{application_config.parser_config, std::move(dssm), std::move(optimizer), std::move(trigrams_registry)};
+    sgl::dssm::ranking ranking{application_config.parser_config, std::move(dssm), std::move(optimizer), std::move(trigrams_registry)};
 
     size_t iteration = 0;
     for (size_t i = 0; i < application_config.training_config.epochs; ++i) {
@@ -367,26 +365,27 @@ void train(sgl::dssm::application_config application_config) {
             application_config.parser_config.outer_separator[0],
             [&](auto first, auto last) {
                 sgl::v1::stopwatch_nanoseconds sw;
-                if (similarity_model_trainer(first, last)) {
+                if (ranking(first, last)) {
                     auto time_took = sw.stop();
-                    std::cerr << "Epoch " << i
-                              << "; Iteration " << ++iteration
-                              << "; " << "Took: " << time_took / 1.0e9
-                              << "; Loss: " << similarity_model_trainer.loss()
-                              << std::endl;
+                    std::cerr << "Iteration took: " << time_took / 1.0e9 << "sec.; "
+                              << "Epoch " << i << "; "
+                              << "Iteration " << ++iteration << "; "
+                              << "Loss: " << ranking.loss() << std::endl;
+                    if (iteration % 128 == 0) {
+                        ranking.save(application_config.output);
+                    }
                 }
             }
         );
-        //similarity_model_trainer.save(output);
     }
-    similarity_model_trainer.save(application_config.output);
+    ranking.save(application_config.output);
 }
 
 } // namespace dssm
 } // namespace sgl
 
 int main(int argc, const char* argv[]) {
-    try {
+   try {
         sgl::v1::argparser argparser(argc, argv);
         auto [input, input_error] = argparser.get<std::string>("-i,--input");
         if (input.empty() || input_error) {
@@ -403,9 +402,9 @@ int main(int argc, const char* argv[]) {
             std::cerr << "-o,--output is required" << std::endl;
             return 1;
         }
-        auto [max_fanin, max_fanin_error] = argparser.get<size_t>("-max-fan-in", 10000ul);
+        auto [max_fanin, max_fanin_error] = argparser.get<size_t>("--max-fanin", 30000ul);
         if (max_fanin_error) {
-            std::cerr << "-e,--train.epochs is an integer" << std::endl;
+            std::cerr << "--max-fanin is an integer" << std::endl;
             return 1;
         }
 
